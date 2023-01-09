@@ -1450,3 +1450,26 @@ opcode!(
         Entry(sqe)
     }
 );
+
+opcode!(
+    /// Get directory entries, equivalent to `getdents64(2)`.
+    pub struct Getdents {
+        fd: { impl sealed::UseFixed },
+        buf: { *const u8 },
+        len: { u32 },
+        ;;
+    }
+
+    pub const CODE = sys::IORING_OP_GETDENTS;
+
+    pub fn build(self) -> Entry {
+        let Getdents { fd, buf, len } = self;
+
+        let mut sqe = sqe_zeroed();
+        sqe.opcode = Self::CODE;
+        assign_fd!(sqe.fd = fd);
+        sqe.__bindgen_anon_2.addr = buf as _;
+        sqe.len = len;
+        Entry(sqe)
+    }
+);

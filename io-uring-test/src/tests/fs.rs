@@ -1,7 +1,8 @@
 use crate::utils;
 use crate::Test;
 use io_uring::{cqueue, opcode, squeue, types, IoUring};
-use std::ffi::CString;
+use std::collections::HashSet;
+use std::ffi::{CStr, CString, OsStr};
 use std::fs;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
@@ -564,6 +565,88 @@ pub fn test_file_splice<S: squeue::EntryMarker, C: cqueue::EntryMarker>(
     pipe_out.read_exact(&mut output)?;
 
     assert_eq!(input, &output[..]);
+
+    Ok(())
+}
+
+pub fn test_getdents<S: squeue::EntryMarker, C: cqueue::EntryMarker>(
+    ring: &mut IoUring<S, C>,
+    test: &Test,
+) -> anyhow::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    require!(
+        test;
+        test.probe.is_supported(opcode::Getdents::CODE);
+    );
+
+    let tmp_dir = tempfile::TempDir::new_in(".")?;
+    let dir = tmp_dir.path();
+    let filenames: &[Vec<u8>] = &[
+        "foo".into(),
+        " ".into(),
+        ["💖👨‍👩‍👧‍👦".as_bytes(), &[0xff, 0xff]].concat().to_vec(),
+        "a".repeat(255).into(),
+    ];
+    for filename in filenames {
+        fs::write(dir.join(OsStr::from_bytes(filename)), [])?;
+    }
+
+    let dir_fd = fs::File::options().read(true).custom_flags(libc::O_DIRECTORY).open(dir)?.into_raw_fd();
+    let mut buf = Vec::with_capacity(32768);
+    let mut entries_filenames = HashSet::<Vec<u8>>::new();
+    let mut count = 0;
+
+    loop {
+        let getdents = opcode::Getdents::new(
+            types::Fd(dir_fd),
+            buf.as_ptr(),
+            buf.capacity() as u32,
+        );
+
+        unsafe {
+            ring.submission()
+                .push(&getdents.build().user_data(0x42).into())
+                .expect("queue is full");
+        }
+
+        ring.submit_and_wait(1)?;
+
+        let cqes: Vec<cqueue::Entry> = ring.completion().map(Into::into).collect();
+
+        assert_eq!(cqes.len(), 1);
+        assert_eq!(cqes[0].user_data(), 0x42);
+
+        let res = cqes[0].result();
+        assert!(res >= 0 && res <= buf.capacity() as i32);
+
+        if res == 0 {
+            break;
+        }
+
+        unsafe {
+            buf.set_len(res as usize);
+        }
+
+        let mut read = 0;
+        while read < buf.len() {
+            unsafe {
+                let dirent = buf[read..].as_ptr() as *const libc::dirent64;
+                let name_offset = ((*dirent).d_name.as_ptr() as *const u8).offset_from(dirent as *const u8) as usize;
+                assert!(buf.len() >= read + name_offset);
+                let rec_len = (*dirent).d_reclen as usize;
+                assert!(buf.len() >= read + rec_len);
+                entries_filenames.insert(CStr::from_ptr((*dirent).d_name.as_ptr()).to_bytes().to_vec());
+                count += 1;
+                read += (*dirent).d_reclen as usize;
+            }
+        }
+    }
+
+    assert_eq!(count, filenames.len());
+    for filename in filenames {
+        assert!(entries_filenames.contains(filename));
+    }
 
     Ok(())
 }
